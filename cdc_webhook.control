@@ -1,0 +1,4 @@
+# cdc_webhook extension
+comment = 'Change Data Capture webhook extension'
+default_version = '1.0'
+relocatable = true
