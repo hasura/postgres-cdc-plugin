@@ -83,11 +83,11 @@ CREATE OR REPLACE FUNCTION call_webhook(
 
 
 CREATE OR REPLACE FUNCTION create_event_trigger(
-    table_name TEXT,
-    webhook_url TEXT,
-    headers JSONB,
-    operations TEXT[],
     name TEXT,
+    table_name TEXT,
+    operations TEXT[],
+    webhook_url TEXT,
+    headers JSONB DEFAULT '{}'::jsonb,
     schema_name TEXT DEFAULT CURRENT_SCHEMA(),
     update_columns TEXT[] DEFAULT '{}',
     timeout INT DEFAULT 10,

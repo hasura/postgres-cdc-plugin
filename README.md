@@ -13,6 +13,7 @@ A PostgreSQL extension that enables Change Data Capture (CDC) by sending webhook
 - Configurable trigger timing (BEFORE or AFTER)
 - Transaction control based on webhook delivery success
 - Secure logging that strips sensitive header values
+- Secure storage of webhook credentials
 
 ## Installation
 
@@ -75,12 +76,12 @@ CREATE TABLE hr.employees (
 Creates a trigger that sends webhook notifications for specified table operations.
 
 ```sql
-SELECT create_event_trigger(
+CREATE OR REPLACE FUNCTION create_event_trigger(
+    name TEXT,  
     table_name TEXT,
-    webhook_url TEXT,
-    headers JSONB,
     operations TEXT[],
-    trigger_name TEXT,
+    webhook_url TEXT,
+    headers JSONB DEFAULT '{}'::jsonb,
     schema_name TEXT DEFAULT CURRENT_SCHEMA(),
     update_columns TEXT[] DEFAULT '{}',
     timeout INT DEFAULT 10,
@@ -88,27 +89,30 @@ SELECT create_event_trigger(
     trigger_timing TEXT DEFAULT 'AFTER',
     retry_number INT DEFAULT 3,
     retry_interval INT DEFAULT 1,
-    retry_backoff TEXT DEFAULT 'LINEAR'
-);
+    retry_backoff TEXT DEFAULT 'LINEAR',
+    security TEXT DEFAULT 'NONE'  
+) RETURNS void
+...
 ```
 
 #### Parameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| table_name | TEXT | required | Name of the table to monitor |
-| webhook_url | TEXT | required | URL to send webhook notifications to |
-| headers | JSONB | required | HTTP headers for webhook requests (e.g., authentication) |
-| operations | TEXT[] | required | Array of operations to monitor: 'INSERT', 'UPDATE', 'DELETE' |
-| trigger_name | TEXT | required | Unique name for the trigger |
+| Parameter | Type | Default          | Description |
+|-----------|------|------------------|-------------|
+| name | TEXT | required         | Unique name for the trigger |
+| table_name | TEXT | required         | Name of the table to monitor |
+| operations | TEXT[] | required         | Array of operations to monitor: 'INSERT', 'UPDATE', 'DELETE' |
+| webhook_url | TEXT | required         | URL to send webhook notifications to |
+| headers | JSONB | '{}'              | HTTP headers for webhook requests (e.g., authentication) |
 | schema_name | TEXT | CURRENT_SCHEMA() | Schema containing the table |
-| update_columns | TEXT[] | '{}' | Columns to monitor for UPDATE operations. Empty array means NO columns will be tracked |
-| timeout | INT | 10 | Webhook request timeout in seconds |
-| cancel_on_failure | BOOLEAN | false | Whether to cancel the transaction if webhook delivery fails |
-| trigger_timing | TEXT | 'AFTER' | When to fire the trigger: 'BEFORE' or 'AFTER' |
-| retry_number | INT | 3 | Number of retry attempts for failed webhook calls |
-| retry_interval | INT | 1 | Base interval between retries in seconds |
-| retry_backoff | TEXT | 'LINEAR' | Retry backoff strategy: 'LINEAR' or 'EXPONENTIAL' |
+| update_columns | TEXT[] | '{}'             | Columns to monitor for UPDATE operations. Empty array means NO columns will be tracked |
+| timeout | INT | 10               | Webhook request timeout in seconds |
+| cancel_on_failure | BOOLEAN | false            | Whether to cancel the transaction if webhook delivery fails |
+| trigger_timing | TEXT | 'AFTER'          | When to fire the trigger: 'BEFORE' or 'AFTER' |
+| retry_number | INT | 3                | Number of retry attempts for failed webhook calls |
+| retry_interval | INT | 1                | Base interval between retries in seconds |
+| retry_backoff | TEXT | 'LINEAR'         | Retry backoff strategy: 'LINEAR' or 'EXPONENTIAL' |
+| security | TEXT | 'NONE'           | Security mode for handling webhook credentials. 'NONE' stores URL and headers directly, 'PRIVATE' stores them securely. |
 
 #### Important Notes
 
@@ -138,36 +142,54 @@ SELECT create_event_trigger(
      CONTEXT:  SQL statement "SELECT call_webhook(payload, webhook_endpoint, webhook_headers, 5, 't', 3, 2, 'EXPONENTIAL')"
      ```
 
+5. **Security Modes**:
+   - 'NONE' mode:
+     - Webhook URL and headers are stored directly in the trigger definition
+     - Credentials are visible to anyone who can view trigger definitions (e.g., `\df` in psql)
+   - 'PRIVATE' mode:
+     - Webhook URL and headers are stored in a separate `cdc_webhook.credentials` table
+     - Credentials table has row-level security enabled, allowing only privileged users to view
+     - Trigger definitions do not contain sensitive information
+     - Recommended for production use and webhooks requiring authentication
+
 ### Example Usage
 
-#### Basic Setup (Public Schema)
+#### Basic Setup (Non-Sensitive or Sensitive)
 ```sql
 SELECT create_event_trigger(
-    'employees',                                      -- table name
-    'http://host.docker.internal:8000/webhook/',      -- webhook URL
-    '{"X-API-Key": "your-secret-key-here"}'::jsonb,  -- headers
-    ARRAY['INSERT', 'UPDATE', 'DELETE'],             -- operations
-    'employee_changes'                               -- trigger name
+    name := 'employee_changes',
+    table_name := 'employees',
+    operations := ARRAY['INSERT', 'UPDATE', 'DELETE'],
+    webhook_url := 'http://host.docker.internal:8000/webhook/',
+    headers := '{"X-API-Key": "your-secret-key-here"}'::jsonb
 );
 ```
 
 #### Advanced Setup (Custom Schema)
 ```sql
 SELECT create_event_trigger(
-    'employees',                                          -- table name
-    'http://host.docker.internal:8000/webhook/',          -- webhook URL
-    '{"X-API-Key": "your-secret-key-here"}'::jsonb,      -- headers
-    ARRAY['INSERT', 'UPDATE', 'DELETE'],                 -- operations
-    'hr_employee_changes',                               -- trigger name
-    'hr',                                               -- schema name
-    ARRAY['salary', 'name'],                            -- track only salary and name changes
-    5,                                                  -- 5 second timeout
-    true,                                               -- cancel transaction on webhook failure
-    'AFTER',                                            -- trigger timing
-    3,                                                  -- 3 retries
-    2,                                                  -- 2 second base interval
-    'EXPONENTIAL'                                       -- exponential backoff
+    name := 'hr_employee_changes',
+    table_name := 'employees',
+    operations := ARRAY['INSERT', 'UPDATE', 'DELETE'],
+    webhook_url := 'http://host.docker.internal:8000/webhook/',
+    headers := '{"X-API-Key": "your-secret-key-here"}'::jsonb,
+    schema_name := 'hr',
+    update_columns := ARRAY['salary', 'name'],
+    timeout := 5,
+    cancel_on_failure := true,
+    trigger_timing := 'AFTER',
+    retry_number := 3,
+    retry_interval := 2,
+    retry_backoff := 'EXPONENTIAL',
+    security := 'PRIVATE'
 );
+```
+
+To view the stored credentials (requires privileges):
+```sql
+SELECT trigger_name, webhook_url, headers
+FROM cdc_webhook.credentials
+WHERE trigger_name = 'hr_employee_changes';  
 ```
 
 ## Webhook Payload Format
@@ -184,11 +206,11 @@ The webhook receives a JSON payload with the following structure:
                 "id": 1,
                 "name": "John Doe",
                 "salary": 80000,
-                "created_at": "2024-06-04T04:27:09.379581"
+                "created_at": "2024-06-04T04:27:09.379581"  
             },
             "old": {
                 "id": 1,
-                "name": "John Doe",
+                "name": "John Doe", 
                 "salary": 75000,
                 "created_at": "2024-06-04T04:27:09.379581"
             }
@@ -202,7 +224,7 @@ The webhook receives a JSON payload with the following structure:
         "name": "employee_changes",
         "timing": "AFTER"
     },
-    "created_at": "2024-06-04T04:27:09.379581+00:00"
+    "created_at": "2024-06-04T04:27:09.379581+00:00"  
 }
 ```
 
@@ -215,7 +237,7 @@ pip3 install -r requirements.txt
 
 2. Start the webhook server:
 ```bash
-uvicorn webhook:app --reload
+uvicorn webhook:app --reload  
 ```
 
 The server will log all received webhooks to the console for debugging.
@@ -227,41 +249,41 @@ After setting up the triggers, you can test the webhook notifications with vario
 ### Insert Operations
 ```sql
 -- Insert into public schema
-INSERT INTO employees (name, salary) 
-VALUES 
+INSERT INTO employees (name, salary)
+VALUES
     ('John Doe', 75000),
     ('Jane Smith', 82000),
     ('Bob Wilson', 65000);
 
 -- Insert into hr schema
-INSERT INTO hr.employees (name, salary) 
-VALUES 
-    ('Alice Brown', 90000),
+INSERT INTO hr.employees (name, salary)
+VALUES
+    ('Alice Brown', 90000),  
     ('Charlie Davis', 78000);
 ```
 
 ### Update Operations
 ```sql
 -- Update single record
-UPDATE employees 
-SET salary = 80000 
+UPDATE employees
+SET salary = 80000
 WHERE name = 'John Doe';
 
 -- Bulk update
-UPDATE hr.employees 
-SET salary = salary * 1.1 
-WHERE salary < 80000;
+UPDATE hr.employees  
+SET salary = salary * 1.1
+WHERE salary < 80000;  
 ```
 
 ### Delete Operations
 ```sql
 -- Delete single record
-DELETE FROM employees 
+DELETE FROM employees
 WHERE name = 'Bob Wilson';
 
 -- Conditional delete
-DELETE FROM hr.employees 
-WHERE salary < 75000;
+DELETE FROM hr.employees
+WHERE salary < 75000;  
 ```
 
 ## Development Notes
