@@ -161,7 +161,10 @@ SELECT create_event_trigger(
     table_name := 'employees',
     operations := ARRAY['INSERT', 'UPDATE', 'DELETE'],
     webhook_url := 'http://host.docker.internal:8000/webhook/',
-    headers := '{"X-API-Key": "your-secret-key-here"}'::jsonb
+    headers := '{"X-API-Key": "your-secret-key-here"}'::jsonb,
+    update_columns := ARRAY['salary'],
+    timeout := 3,
+    retry_number := 0
 );
 ```
 
@@ -174,7 +177,7 @@ SELECT create_event_trigger(
     webhook_url := 'http://host.docker.internal:8000/webhook/',
     headers := '{"X-API-Key": "your-secret-key-here"}'::jsonb,
     schema_name := 'hr',
-    update_columns := ARRAY['salary', 'name'],
+    update_columns := ARRAY['salary'],
     timeout := 5,
     cancel_on_failure := true,
     trigger_timing := 'AFTER',
