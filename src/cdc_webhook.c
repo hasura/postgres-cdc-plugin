@@ -21,6 +21,8 @@
 #include <unistd.h>
 #include <math.h>
 
+#include "cdc_webhook_worker.h"
+
 /* PostgreSQL extension magic */
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;

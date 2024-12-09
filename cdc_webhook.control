@@ -2,3 +2,4 @@
 comment = 'Change Data Capture webhook extension'
 default_version = '1.0'
 relocatable = true
+module_pathname = '$libdir/cdc_webhook'

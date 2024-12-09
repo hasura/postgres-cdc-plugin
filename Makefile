@@ -1,6 +1,6 @@
 EXTENSION = cdc_webhook
 MODULE_big = cdc_webhook
-OBJS = src/cdc_webhook.o
+OBJS = src/cdc_webhook.o src/cdc_webhook_worker.o
 DATA = cdc_webhook--1.0.sql
 
 PG_CONFIG = pg_config

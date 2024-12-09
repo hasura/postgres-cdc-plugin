@@ -39,6 +39,9 @@ RUN echo "host all all 0.0.0.0/0 trust" >> "$PGDATA/pg_hba.conf"
 # Allow remote connections to PostgreSQL server
 RUN echo "listen_addresses='*'" >> "$PGDATA/postgresql.conf"
 
+RUN echo "shared_preload_libraries = 'cdc_webhook'" >> "$PGDATA/postgresql.conf"
+RUN echo "max_worker_processes = 50" >> "$PGDATA/postgresql.conf"
+
 # Run PostgreSQL server and create database and extensions
 CMD pg_ctl -D "$PGDATA" -o "-c listen_addresses='*'" -w start && \
     psql --command "CREATE DATABASE testdb;" && \

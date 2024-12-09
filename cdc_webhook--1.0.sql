@@ -1,27 +1,12 @@
 --==============================================================================
 -- PostgreSQL CDC Webhook Extension SQL Functions
 -- Version: 1.0
---
--- Description:
---     This extension provides mechanisms for Change Data Capture (CDC) using
---     PostgreSQL triggers. When configured, it sends webhook notifications
---     (HTTP requests) upon insert, update, or delete operations on specified tables.
---
--- Features:
---     - Supports both "NONE" and "PRIVATE" security modes for storing sensitive
---       webhook credentials.
---     - Allows specifying HTTP headers, retry strategies, and request timeouts.
---     - Offers row-level security for stored credentials.
---
--- Note:
---     The `call_webhook()` function is assumed to be implemented in C and provided
---     by an external extension (compiled and installed C library).
 --==============================================================================
 
 CREATE SCHEMA IF NOT EXISTS cdc_webhook;
 REVOKE ALL ON SCHEMA cdc_webhook FROM PUBLIC;
 
-
+-- Credentials table for storing webhook authentication
 CREATE TABLE IF NOT EXISTS cdc_webhook.credentials
 (
     id             SERIAL PRIMARY KEY,
@@ -36,19 +21,54 @@ CREATE TABLE IF NOT EXISTS cdc_webhook.credentials
     UNIQUE (trigger_schema, trigger_table, trigger_name)
 );
 
+-- Event log table for async webhook delivery
+CREATE TABLE IF NOT EXISTS cdc_webhook.event_log
+(
+    id                BIGSERIAL PRIMARY KEY,
+    trigger_schema    TEXT    NOT NULL,
+    trigger_table     TEXT    NOT NULL,
+    trigger_name      TEXT    NOT NULL,
+    webhook_url       TEXT,
+    headers           JSONB,
+    payload           JSONB   NOT NULL,
+    timeout           INTEGER NOT NULL DEFAULT 10,
+    status            TEXT    NOT NULL CHECK (status IN ('PENDING', 'IN_PROGRESS', 'DELIVERED', 'FAILED')),
+    attempt_count     INTEGER          DEFAULT 0,
+    attempts_time     TIMESTAMPTZ[],
+    attempts_status   INTEGER[],
+    attempts_response JSONB[],
+    next_attempt      TIMESTAMPTZ,
+    retry_number      INTEGER NOT NULL,
+    retry_interval    INTEGER NOT NULL,
+    retry_backoff     TEXT    NOT NULL,
+    created_at        TIMESTAMPTZ      DEFAULT CURRENT_TIMESTAMP,
+    updated_at        TIMESTAMPTZ      DEFAULT CURRENT_TIMESTAMP,
+    created_by        NAME             DEFAULT CURRENT_USER
+);
+
+-- Indexes for event log querying
+CREATE INDEX idx_event_log_status ON cdc_webhook.event_log (status);
+CREATE INDEX idx_event_log_next_attempt ON cdc_webhook.event_log (next_attempt);
+CREATE INDEX idx_event_log_status_next_attempt ON cdc_webhook.event_log (status, next_attempt);
+
 -- Enable row-level security
 ALTER TABLE cdc_webhook.credentials
     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cdc_webhook.event_log
+    ENABLE ROW LEVEL SECURITY;
 
--- Policy:
--- Only superusers (or a specified role 'postgres') can access these rows.
--- Adjust pg_has_role check as needed for your environment.
+-- Policies for credentials and event log
 CREATE POLICY credentials_access ON cdc_webhook.credentials
     FOR ALL
     TO PUBLIC
     USING (pg_has_role(CURRENT_USER, 'postgres', 'MEMBER'));
 
+CREATE POLICY event_log_access ON cdc_webhook.event_log
+    FOR ALL
+    TO PUBLIC
+    USING (pg_has_role(CURRENT_USER, 'postgres', 'MEMBER'));
 
+-- Audit triggers
 CREATE OR REPLACE FUNCTION cdc_webhook.credentials_audit_trigger()
     RETURNS TRIGGER AS
 $$
@@ -64,7 +84,20 @@ CREATE TRIGGER credentials_audit
     FOR EACH ROW
 EXECUTE FUNCTION cdc_webhook.credentials_audit_trigger();
 
+CREATE OR REPLACE FUNCTION cdc_webhook.event_log_audit_trigger()
+    RETURNS TRIGGER AS
+$$
+BEGIN
+    NEW.updated_at := CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 
+CREATE TRIGGER event_log_audit
+    BEFORE UPDATE
+    ON cdc_webhook.event_log
+    FOR EACH ROW
+EXECUTE FUNCTION cdc_webhook.event_log_audit_trigger();
 
 CREATE OR REPLACE FUNCTION call_webhook(
     payload JSONB,
@@ -80,8 +113,6 @@ CREATE OR REPLACE FUNCTION call_webhook(
 'cdc_webhook',
 'call_webhook';
 
-
-
 CREATE OR REPLACE FUNCTION create_event_trigger(
     name TEXT,
     table_name TEXT,
@@ -96,7 +127,8 @@ CREATE OR REPLACE FUNCTION create_event_trigger(
     retry_number INT DEFAULT 3,
     retry_interval INT DEFAULT 1,
     retry_backoff TEXT DEFAULT 'LINEAR',
-    security TEXT DEFAULT 'NONE'
+    security TEXT DEFAULT 'NONE',
+    mode TEXT DEFAULT 'SYNC'
 ) RETURNS void
     LANGUAGE plpgsql
     SECURITY DEFINER
@@ -123,6 +155,16 @@ BEGIN
     -- Validate security mode
     IF security NOT IN ('NONE', 'PRIVATE') THEN
         RAISE EXCEPTION 'security must be either NONE or PRIVATE';
+    END IF;
+
+    -- Validate mode
+    IF mode NOT IN ('SYNC', 'ASYNC') THEN
+        RAISE EXCEPTION 'mode must be either SYNC or ASYNC';
+    END IF;
+
+    -- Validate mode and cancel_on_failure combination
+    IF mode = 'ASYNC' AND cancel_on_failure = true THEN
+        RAISE EXCEPTION 'cancel_on_failure cannot be true when mode is ASYNC';
     END IF;
 
     -- Validate retry_number and retry_interval
@@ -155,7 +197,7 @@ BEGIN
         stored_headers := NULL; -- Will be retrieved at runtime from credentials
         END CASE;
 
-    -- Construct the trigger operation clause (e.g., "AFTER INSERT OR UPDATE OR DELETE ON")
+    -- Construct the trigger operation clause
     operation_clause := trigger_timing || ' ' || array_to_string(operations, ' OR ') || ' ON ';
 
     -- Generate column check statements for UPDATE operations if update_columns are specified
@@ -206,7 +248,7 @@ BEGIN
                     AND trigger_name = %L;
             END CASE;
 
-            -- Build the JSON payload describing the event
+            -- Build the JSON payload
             payload := jsonb_build_object(
                 'created_at', current_timestamp,
                 'id', gen_random_uuid(),
@@ -237,17 +279,49 @@ BEGIN
                 )
             );
 
-            -- Call the external webhook function
-            PERFORM public.call_webhook(
-                payload,
-                webhook_endpoint,
-                webhook_headers,
-                %L,  -- timeout
-                %L,  -- cancel_on_failure
-                %L,  -- retry_number
-                %L,  -- retry_interval
-                %L   -- retry_backoff
-            );
+            -- Handle webhook based on mode
+            IF %L = 'SYNC' THEN
+                -- Call the webhook synchronously
+                PERFORM public.call_webhook(
+                    payload,
+                    webhook_endpoint,
+                    webhook_headers,
+                    %L::integer,
+                    %L::boolean,
+                    %L::integer,
+                    %L::integer,
+                    %L
+                );
+            ELSE
+                -- Insert into event_log for async processing
+                INSERT INTO cdc_webhook.event_log (
+                    trigger_schema,
+                    trigger_table,
+                    trigger_name,
+                    webhook_url,
+                    headers,
+                    payload,
+                    timeout,
+                    status,
+                    retry_number,
+                    retry_interval,
+                    retry_backoff,
+                    next_attempt
+                ) VALUES (
+                    TG_TABLE_SCHEMA,
+                    TG_TABLE_NAME,
+                    %L,
+                    webhook_endpoint,
+                    webhook_headers,
+                    payload,
+                    %L::integer,
+                    'PENDING',
+                    %L::integer,
+                    %L::integer,
+                    %L,
+                    CURRENT_TIMESTAMP
+                );
+            END IF;
 
             RETURN NULL;
         END;
@@ -262,8 +336,16 @@ BEGIN
                    name,
                    name,
                    trigger_timing,
+                   mode,
                    timeout,
                    cancel_on_failure,
+                   retry_number,
+                   retry_interval,
+                   retry_backoff,
+                   name,
+                   security,
+                   security,
+                   timeout,
                    retry_number,
                    retry_interval,
                    retry_backoff
@@ -285,6 +367,7 @@ BEGIN
 END;
 $$;
 
-
 GRANT USAGE ON SCHEMA cdc_webhook TO PUBLIC;
+GRANT USAGE ON SCHEMA cdc_webhook TO postgres;
+GRANT ALL ON ALL TABLES IN SCHEMA cdc_webhook TO postgres;
 GRANT EXECUTE ON FUNCTION create_event_trigger TO PUBLIC;
